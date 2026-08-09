@@ -117,3 +117,24 @@ async def latest_jobs(
         "created_at": j.created_at.isoformat() if j.created_at else None,
         "completed_at": j.completed_at.isoformat() if j.completed_at else None,
     } for j in rows]
+
+
+
+@router.get("/claims/latest")
+async def latest_claims(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    admin: Annotated[CurrentAdmin, Depends(get_current_admin)],  # noqa: ARG001
+) -> list[dict]:
+    """Return all claims with their IDs (debug helper)."""
+    from app.models.claim import Claim
+    from sqlalchemy import select
+    result = await db.execute(select(Claim).order_by(Claim.created_at.desc()))
+    return [
+        {
+            "id": str(c.id),
+            "claim_no": c.claim_no,
+            "gnc_file_no": c.gnc_file_no,
+            "file_name": c.file_name,
+        }
+        for c in result.scalars().all()
+    ]
