@@ -303,6 +303,7 @@ Produce the JSON now.
 # ---------------------------------------------------------------------------
 # Prompt version — bumping this string invalidates every cached analysis
 # ---------------------------------------------------------------------------
-# v1.1 — added explicit CALLING_TASK/EMAIL_SHORT quantity guidance to fix
-#        AI conflating the RATE (e.g. "15 min per call") with the QUANTITY.
-PROMPT_VERSION = "v1.1"
+# v1.2 — typed KeyFacts sub-model to fix OpenAI strict-schema error where
+#        dict[str, Any] was being rejected. Also added explicit client_name
+#        guidance (adjusting firm, not carrier).
+PROMPT_VERSION = "v1.2"
