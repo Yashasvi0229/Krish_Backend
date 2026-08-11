@@ -169,8 +169,27 @@ async def _analyze_claim_async(
             await _progress(job_id, pct, 2,
                             f"Analyzing attachments ({i + 1}/{len(attachments)})", stats)
 
+        # ---- Enrich client + claim from AI-extracted facts ----
+        # Attachments (RCV reports, cover letters, etc.) contain the ground
+        # truth about the insured and the client. If our stored client is
+        # still the "Unassigned" placeholder from Step 4's Gmail sync, use
+        # what the AI extracted to fill it in. This runs BEFORE we snapshot
+        # into the draft, so the draft shows real names.
+        try:
+            await _enrich_from_ai_facts(
+                claim_id=claim_id,
+                client_id=(client.id if client else None),
+                attachment_analyses=attachment_analyses,
+            )
+        except Exception:  # noqa: BLE001 — enrichment is best-effort
+            log.exception("enrichment_failed", claim_id=str(claim_id))
+
         # ---- Build line items via rules engine ----
         await _progress(job_id, 85, 3, "Applying billing rules", stats)
+
+        # Re-read the enriched client so hourly_rate reflects any updates.
+        async with AsyncSessionLocal() as session:
+            client = await session.get(Client, claim.client_id) if claim else None
 
         line_items: list[dict[str, Any]] = []
         hourly_rate = _resolve_hourly_rate(client)
@@ -348,15 +367,24 @@ def _accumulate(stats: dict[str, Any], analysis, was_cached: bool) -> None:
 
 
 def _resolve_hourly_rate(client) -> Decimal:
+    """Return the client's hourly rate — falls back to $150 if unset OR zero.
+
+    Historical placeholder clients were created with `rate_config = {"hourly_rate": 0}`
+    which silently produced $0 invoices. Treat non-positive rates as "not
+    configured" so those still get the sensible default.
+    """
     if client is None or not client.rate_config:
         return DEFAULT_HOURLY_RATE
     raw = client.rate_config.get("hourly_rate")
     if raw is None:
         return DEFAULT_HOURLY_RATE
     try:
-        return Decimal(str(raw))
+        rate = Decimal(str(raw))
     except Exception:  # noqa: BLE001
         return DEFAULT_HOURLY_RATE
+    if rate <= 0:
+        return DEFAULT_HOURLY_RATE
+    return rate
 
 
 def _billing_period(emails) -> tuple[date, date]:
@@ -422,3 +450,92 @@ async def _fail(job_id: uuid.UUID, msg: str) -> None:
         await job_repo.mark_failed(session, job_id, msg)
         await session.commit()
     await job_service.publish_completion(job_id, status="FAILED", error=msg)
+
+
+# ---------------------------------------------------------------------------
+# Auto-enrichment — populate client + claim from AI-extracted facts
+# ---------------------------------------------------------------------------
+async def _enrich_from_ai_facts(
+    *,
+    claim_id: uuid.UUID,
+    client_id: uuid.UUID | None,
+    attachment_analyses: dict[uuid.UUID, Any],
+) -> None:
+    """Update the placeholder client and the claim's insured_details from
+    facts the AI extracted from attachments.
+
+    Called once per analyze-claim job, AFTER all attachments have been
+    analyzed. Idempotent — safe to re-run: it only OVERWRITES fields
+    that are still empty / at their placeholder value.
+
+    Fields the AI can extract (see attachment schema `key_facts`):
+        insured_name, client_name, claim_no, gnc_file_no, adjuster_file_no,
+        date_of_loss, total_rcv, total_acv, op_percent
+
+    Priority when the same field appears in multiple attachments:
+        * Higher-confidence analysis wins
+        * On ties, first non-empty value wins
+    """
+    if not attachment_analyses:
+        return
+
+    # ---- Pick the highest-confidence key_facts per field ----
+    def _bucket(conf: str) -> int:
+        return {"High": 3, "Medium": 2, "Low": 1}.get(conf or "", 0)
+
+    # Sort analyses so highest confidence is processed first — later
+    # writes are skipped if we already have a value.
+    ordered = sorted(
+        attachment_analyses.values(),
+        key=lambda a: _bucket(a.confidence),
+        reverse=True,
+    )
+
+    merged: dict[str, Any] = {}
+    for a in ordered:
+        facts = ((a.raw_response or {}).get("key_facts") or {}) if a.raw_response else {}
+        for k, v in facts.items():
+            if v in (None, "", 0):
+                continue
+            merged.setdefault(k, v)
+
+    if not merged:
+        return
+
+    # ---- Apply to DB ----
+    async with AsyncSessionLocal() as session:
+        # 1. Update the claim's insured_details
+        claim = await session.get(Claim, claim_id)
+        if claim is None:
+            return
+
+        insured_details = dict(claim.insured_details or {})
+        if not insured_details.get("insured_name") and merged.get("insured_name"):
+            insured_details["insured_name"] = str(merged["insured_name"])[:255]
+            claim.insured_details = insured_details
+            log.info("enriched_insured_name", claim_id=str(claim_id),
+                     name=insured_details["insured_name"])
+
+        # Also date_of_loss if we don't have one
+        if not claim.date_of_loss and merged.get("date_of_loss"):
+            try:
+                from datetime import date as _date
+                # Accept ISO strings or date objects
+                raw_dol = merged["date_of_loss"]
+                if isinstance(raw_dol, str) and len(raw_dol) >= 10:
+                    claim.date_of_loss = _date.fromisoformat(raw_dol[:10])
+                    log.info("enriched_date_of_loss", claim_id=str(claim_id))
+            except (ValueError, TypeError):
+                pass
+
+        # 2. Update the placeholder client with a real name/company
+        if client_id is not None and merged.get("client_name"):
+            client_row = await session.get(Client, client_id)
+            if client_row is not None and client_row.name == "Unassigned":
+                new_name = str(merged["client_name"])[:255]
+                client_row.name = new_name
+                client_row.company_legal_name = new_name
+                log.info("enriched_client_name",
+                         client_id=str(client_id), name=new_name)
+
+        await session.commit()
