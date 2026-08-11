@@ -111,23 +111,38 @@ than politeness.
    (0.7 hrs/page) cap at 25 hours total, whichever is less. You report
    the raw page count as quantity; the engine applies the cap.
 
-6. UNCLEAR IS A VALID ANSWER — If the email or document does not clearly
+6. CALLING_TASK QUANTITY — When you classify something as CALLING_TASK,
+   `quantity.value` is the NUMBER OF PHONE CALLS being assigned in that
+   email — almost always 1. Do NOT put 15 there; "15 min per call" is
+   the RATE (set by the engine), NOT the quantity. Examples:
+     * "Please call the insured to confirm access" → quantity 1
+     * "Please make calls to the three vendors listed" → quantity 3
+     * "Please arrange the site visit with the insured" (implies one
+       coordination call) → quantity 1
+
+7. EMAIL_SHORT / EMAIL_DESCRIPTIVE QUANTITY — Each individual email you
+   are analyzing counts as ONE unit:
+     * EMAIL_SHORT: quantity is 1 (unit EMAILS) — never 0.1 or fractions
+     * EMAIL_DESCRIPTIVE: quantity is the number of half-page chunks
+       of body text (1 for typical emails, 2+ for very long ones)
+
+8. UNCLEAR IS A VALID ANSWER — If the email or document does not clearly
    fit any of the 25 rules, classify as UNCLEAR (for emails) or set
    billing_rule_code to null (for attachments) and set
    requires_manual_review=true. The client explicitly told us "some
    files fall outside the guidelines — we handle those case-by-case."
    Do NOT force a match.
 
-7. PHOTOS — Photos of a site visit are documentation, not a billable
+9. PHOTOS — Photos of a site visit are documentation, not a billable
    deliverable. Set document_type=PHOTO, billing_rule_code=null. The
    Site Visit billing (rule SITE_VISIT) is triggered by a Site Visit
    email or work-authorization document, and the actual hours are set
    from the approved fee budget or the consultant's time sheet — not
    inferred from photos.
 
-8. `is_internal` FIELD — You may see an `is_internal: true` flag in the
-   input metadata. Treat it as a hint (all-@gncgroup.ca participants);
-   still apply rule #1 above.
+10. `is_internal` FIELD — You may see an `is_internal: true` flag in the
+    input metadata. Treat it as a hint (all-@gncgroup.ca participants);
+    still apply rule #1 above.
 </hard_rules>
 
 <billing_rules_table>
@@ -288,4 +303,6 @@ Produce the JSON now.
 # ---------------------------------------------------------------------------
 # Prompt version — bumping this string invalidates every cached analysis
 # ---------------------------------------------------------------------------
-PROMPT_VERSION = "v1.0"
+# v1.1 — added explicit CALLING_TASK/EMAIL_SHORT quantity guidance to fix
+#        AI conflating the RATE (e.g. "15 min per call") with the QUANTITY.
+PROMPT_VERSION = "v1.1"
