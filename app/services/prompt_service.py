@@ -303,7 +303,6 @@ Produce the JSON now.
 # ---------------------------------------------------------------------------
 # Prompt version — bumping this string invalidates every cached analysis
 # ---------------------------------------------------------------------------
-# v1.2 — typed KeyFacts sub-model to fix OpenAI strict-schema error where
-#        dict[str, Any] was being rejected. Also added explicit client_name
-#        guidance (adjusting firm, not carrier).
-PROMPT_VERSION = "v1.2"
+# v1.3 — fix OpenAI strict-mode $ref sibling issue (description next to $ref
+#        was rejected as "$ref cannot have keywords {description}").
+PROMPT_VERSION = "v1.3"
