@@ -423,7 +423,9 @@ async def _find_or_create_claim(
                 phone="—",
                 address_line1="—",
                 rate_strategy=RateStrategy.FLAT.value,
-                rate_config={"hourly_rate": 0},
+                # Default $150/hr so drafts against the placeholder still
+                # produce non-zero totals. Admin can override per-client.
+                rate_config={"hourly_rate": 150},
                 template_path="",
             )
             session.add(placeholder)
