@@ -221,6 +221,72 @@ class EmailAnalysisOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Key facts block — typed extraction for enrichment
+# ---------------------------------------------------------------------------
+# WHY typed instead of dict[str, Any]:
+#     OpenAI strict-mode json_schema rejects free-form dicts —
+#     `additionalProperties: true` isn't allowed and empty-properties
+#     objects fail validation ("Extra required key 'key_facts' supplied").
+#     A concrete sub-model gives the AI a defined shape AND lets our
+#     enrichment code use typed access instead of dict.get() everywhere.
+class KeyFacts(BaseModel):
+    """Facts the AI can pull from a document, used to auto-populate the
+    client + claim + insured records. Every field is optional — the AI
+    fills only what it can confidently extract."""
+    model_config = ConfigDict(extra="forbid")
+
+    insured_name: str | None = Field(
+        default=None,
+        description="The homeowner / policyholder name (e.g. 'John Doe').",
+        max_length=255,
+    )
+    client_name: str | None = Field(
+        default=None,
+        description=(
+            "The GNC CLIENT that engaged us — usually the ADJUSTING FIRM "
+            "(e.g. 'Kendal Adjusters Inc.'), NOT the insurance carrier "
+            "(e.g. 'Peace Hills Insurance') and NOT the insured."
+        ),
+        max_length=255,
+    )
+    claim_no: str | None = Field(
+        default=None,
+        description="Insurance carrier's claim number, e.g. '000-00-055683'.",
+        max_length=100,
+    )
+    gnc_file_no: str | None = Field(
+        default=None,
+        description="GNC's internal file number, e.g. '2413BA'.",
+        max_length=100,
+    )
+    adjuster_file_no: str | None = Field(
+        default=None,
+        description="Adjusting firm's file number, e.g. '26-032939'.",
+        max_length=100,
+    )
+    date_of_loss: str | None = Field(
+        default=None,
+        description="ISO date (YYYY-MM-DD) of the loss event, if stated.",
+        max_length=10,
+    )
+    total_rcv: float | None = Field(
+        default=None,
+        description="Total Replacement Cost Value in USD, e.g. 1277422.16.",
+        ge=0,
+    )
+    total_acv: float | None = Field(
+        default=None,
+        description="Total Actual Cash Value in USD, if reported.",
+        ge=0,
+    )
+    op_percent: float | None = Field(
+        default=None,
+        description="Overhead & Profit percentage (as number 0-100).",
+        ge=0, le=100,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Attachment analysis
 # ---------------------------------------------------------------------------
 class AttachmentAnalysisOutput(BaseModel):
@@ -314,13 +380,14 @@ class AttachmentAnalysisOutput(BaseModel):
         max_length=200,
     )
 
-    key_facts: dict[str, Any] = Field(
-        default_factory=dict,
+    key_facts: KeyFacts = Field(
+        default_factory=KeyFacts,
         description=(
-            "Extracted facts as a flat key-value dict. Recommended keys: "
-            "insured_name, client_name, claim_no, gnc_file_no, adjuster_file_no, "
-            "date_of_loss, total_rcv, total_acv, op_percent. Include only what "
-            "you can confidently extract."
+            "Extracted facts used to auto-populate the client + claim + "
+            "insured records. Fill only the fields you can confidently "
+            "extract; leave the rest null. See KeyFacts definition for "
+            "field semantics — especially client_name (the adjusting firm, "
+            "NOT the carrier or the insured)."
         ),
     )
 
