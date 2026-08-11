@@ -338,7 +338,7 @@ async def _save_attachment_success(
             "quantity": parsed.quantity.model_dump() if parsed.quantity else None,
             "estimate_amount_usd": parsed.estimate_amount_usd,
             "building_count": parsed.building_count,
-            "key_facts": parsed.key_facts,
+            "key_facts": parsed.key_facts.model_dump() if parsed.key_facts else {},
         },
     )
 
