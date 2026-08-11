@@ -439,7 +439,24 @@ def openai_response_format(model: type[BaseModel], name: str) -> dict[str, Any]:
 
 
 def _make_strict(schema: dict[str, Any]) -> None:
-    """Recursively enforce OpenAI's strict-mode invariants on a JSON schema."""
+    """Recursively enforce OpenAI's strict-mode invariants on a JSON schema.
+
+    Two invariants matter:
+      1. Every object must have `additionalProperties: false` and `required`
+         listing every property key.
+      2. A `$ref` node cannot have sibling keywords (OpenAI-specific).
+         Pydantic likes to attach `description` and `default` next to
+         `$ref`; we strip those, since keeping them makes OpenAI reject
+         the whole response_format with 400.
+    """
+    # ---- Fix (2): strip siblings from any $ref node ----
+    if "$ref" in schema:
+        for k in list(schema.keys()):
+            if k != "$ref":
+                schema.pop(k)
+        return   # nothing else to enforce on a bare $ref
+
+    # ---- Fix (1): object-level strict rules ----
     if schema.get("type") == "object" or "properties" in schema:
         schema.setdefault("additionalProperties", False)
         props = schema.get("properties") or {}
