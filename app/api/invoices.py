@@ -190,12 +190,17 @@ async def download_invoice(
 # Helpers
 # ---------------------------------------------------------------------------
 def _resolve_hourly_rate(client) -> Decimal:
+    """Return the client's hourly rate — falls back to $150 if unset OR zero.
+    Must stay in sync with the same helper in app/workers/ai_tasks.py."""
     if client is None or not client.rate_config:
         return Decimal("150.00")
     raw = (client.rate_config or {}).get("hourly_rate")
     if raw is None:
         return Decimal("150.00")
     try:
-        return Decimal(str(raw))
+        rate = Decimal(str(raw))
     except Exception:  # noqa: BLE001
         return Decimal("150.00")
+    if rate <= 0:
+        return Decimal("150.00")
+    return rate
