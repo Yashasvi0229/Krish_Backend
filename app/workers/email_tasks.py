@@ -252,9 +252,14 @@ async def _process_gmail_search_async(
         await _progress(job_id, 95, 4, "Finalizing", stats)
 
         async with AsyncSessionLocal() as session:
+            # Persist claim_id in the job's result_data so the frontend can
+            # kick off the follow-up analysis without needing a separate
+            # lookup call. The claim was created/found in step 3.
             await job_repo.mark_completed(session, job_id, {
                 "stats": stats,
-                "claim_id": None,  # populated below
+                "claim_id": str(claim.id),
+                "claim_no": claim.claim_no,
+                "gnc_file_no": claim.gnc_file_no,
                 "email_ids": [str(eid) for eid in email_by_gmail_id.values()],
             })
             # persist refreshed access token, if any
@@ -263,9 +268,13 @@ async def _process_gmail_search_async(
 
         await job_service.publish_completion(
             job_id, status="COMPLETED",
-            result={"stats": stats, "created_email_ids": [str(x) for x in email_by_gmail_id.values()]},
+            result={
+                "stats": stats,
+                "claim_id": str(claim.id),
+                "created_email_ids": [str(x) for x in email_by_gmail_id.values()],
+            },
         )
-        return {"stats": stats}
+        return {"stats": stats, "claim_id": str(claim.id)}
 
     except Exception as exc:  # noqa: BLE001 — always want to mark job failed
         log.exception("gmail_search_job_failed", job_id=job_id_str)
