@@ -82,6 +82,16 @@ def create_app() -> FastAPI:
     app.include_router(analysis_router, prefix="/api/claims", tags=["ai-analysis"])
     app.include_router(invoices_router, prefix="/api",        tags=["invoices"])
 
+    # Phase 1 additions — dashboard stats + read-only rules/clients for the
+    # review UI dropdowns and the admin listing pages.
+    from app.api.dashboard import router as dashboard_router
+    from app.api.rules import router as rules_router
+    from app.api.clients import router as clients_router
+
+    app.include_router(dashboard_router, prefix="/api/dashboard", tags=["dashboard"])
+    app.include_router(rules_router,     prefix="/api/rules",     tags=["rules"])
+    app.include_router(clients_router,   prefix="/api/clients",   tags=["clients"])
+
     return app
 
 
