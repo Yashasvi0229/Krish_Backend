@@ -51,6 +51,15 @@ async def logout() -> Response:
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+# Alias — the frontend's api.js uses `/auth/signout`. Kept as a separate
+# route (not just `path=[...]` in the same decorator) so it shows up
+# distinctly in Swagger and can diverge later if needed.
+@router.post("/signout", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+async def signout() -> Response:
+    """Alias for /logout — same semantics, different name for frontend."""
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # ---- Google OAuth callback --------------------------------------------------
 @router.get("/google/callback", response_model=None, include_in_schema=True)
 async def google_callback(
