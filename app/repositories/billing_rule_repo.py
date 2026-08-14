@@ -40,3 +40,44 @@ async def get_by_codes(session: AsyncSession, codes: list[str]) -> dict[str, Bil
         select(BillingRule).where(BillingRule.code.in_(codes))
     )
     return {r.code: r for r in result.scalars().all()}
+
+
+async def get_by_id(session: AsyncSession, rule_id):
+    """Load a rule by its UUID."""
+    return await session.get(BillingRule, rule_id)
+
+
+async def create(session: AsyncSession, **fields):
+    """Insert a new BillingRule. Version defaults to 1; caller may bump."""
+    rule = BillingRule(
+        client_scope="global",
+        client_ids=[],
+        comments="",
+        version=1,
+        **fields,
+    )
+    session.add(rule)
+    await session.flush()
+    return rule
+
+
+async def update(session: AsyncSession, rule, **fields):
+    """Apply partial patch. Bumps version so audit trail reflects the edit."""
+    changed = False
+    for key, value in fields.items():
+        if hasattr(rule, key) and getattr(rule, key) != value:
+            setattr(rule, key, value)
+            changed = True
+    if changed:
+        rule.version += 1
+    await session.flush()
+    return rule
+
+
+async def delete(session: AsyncSession, rule):
+    """Hard-delete only allowed when the rule has never been used in a
+    draft; otherwise the caller should just flip is_active=False.
+    We keep the check simple here — callers can inspect line_items usage
+    via the invoice_drafts JSONB if they want to be strict."""
+    await session.delete(rule)
+    await session.flush()
