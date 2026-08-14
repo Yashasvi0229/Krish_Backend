@@ -70,6 +70,20 @@ async def approve_draft(
             f"Only DRAFT/PENDING_* drafts may be approved."
         )
 
+    # Guard: refuse to render an empty invoice. Details of why in
+    # workflow_service.advance_stage — same rule applies here.
+    active_lines = [li for li in (draft.line_items or []) if not li.get("removed")]
+    if not active_lines:
+        raise ConflictError(
+            "Cannot approve — draft has no billable line items. "
+            "Add at least one line or reject this draft."
+        )
+    if float(draft.grand_total or 0) <= 0:
+        raise ConflictError(
+            "Cannot approve — draft total is zero or negative. "
+            "Check the line items before finalizing."
+        )
+
     client = await db.get(Client, draft.client_id)
     hourly_rate = _resolve_hourly_rate(client)
 
@@ -81,7 +95,7 @@ async def approve_draft(
         client_details=draft.client_details,
         insured_details=draft.insured_details,
         loss_details=draft.loss_details,
-        line_items=list(draft.line_items or []),
+        line_items=active_lines,
         billing_period_start=draft.billing_period_start,
         billing_period_end=draft.billing_period_end,
         subtotal=Decimal(str(draft.subtotal)),
@@ -99,7 +113,7 @@ async def approve_draft(
         "client_details": draft.client_details,
         "insured_details": draft.insured_details,
         "loss_details": draft.loss_details,
-        "line_items": list(draft.line_items or []),
+        "line_items": active_lines,
         "subtotal": float(draft.subtotal),
         "grand_total": float(draft.grand_total),
         "currency": draft.currency,
