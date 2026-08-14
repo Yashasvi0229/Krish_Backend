@@ -704,3 +704,61 @@ async def duplicate_invoice(
         "source_invoice_no": inv.invoice_no,
         "message": f"Draft {draft.invoice_no} created from {inv.invoice_no}.",
     }
+
+
+# ===========================================================================
+# Draft listing (global) — dashboard "Pending Review" section
+# ===========================================================================
+@router.get("/drafts")
+async def list_drafts(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    admin: Annotated[CurrentAdmin, Depends(get_current_admin)],  # noqa: ARG001
+    status: str | None = None,
+    pending: bool = False,          # convenience filter — all PENDING_* + DRAFT
+    client_id: uuid.UUID | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> dict:
+    """List drafts across all claims. `pending=true` returns everything
+    that needs human review (DRAFT, PENDING_PM, PENDING_HOUR_VERIFY,
+    PENDING_RS) — the exact set the dashboard's Pending Review card counts.
+    """
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
+    statuses = None
+    if pending:
+        statuses = [
+            DraftStatus.DRAFT.value,
+            DraftStatus.PENDING_PM.value,
+            DraftStatus.PENDING_HOUR_VERIFY.value,
+            DraftStatus.PENDING_RS.value,
+        ]
+
+    from app.services import workflow_service
+    rows, total = await draft_repo.list_paginated(
+        db, status=status, statuses=statuses,
+        client_id=client_id, limit=limit, offset=offset,
+    )
+
+    items = []
+    for d in rows:
+        items.append({
+            "id": str(d.id),
+            "invoice_no": d.invoice_no,
+            "claim_id": str(d.claim_id),
+            "client_id": str(d.client_id),
+            "status": d.status,
+            "stage": workflow_service.STAGE_LABEL.get(d.status, d.status),
+            "grand_total": float(d.grand_total),
+            "currency": d.currency,
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+            # Denormalized labels for list display — spare the frontend a lookup.
+            "client_name": (d.client_details or {}).get("name"),
+            "insured_name": (d.insured_details or {}).get("insured_name"),
+            "claim_no": (d.loss_details or {}).get("claim_no"),
+            "gnc_file_no": d.gnc_file_no,
+            "has_duplicate_warning": d.duplicate_warning is not None,
+        })
+
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
