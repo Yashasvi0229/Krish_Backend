@@ -533,3 +533,122 @@ async def list_claim_drafts(
             ),
         } for d in drafts
     ]
+
+
+# ===========================================================================
+# Invoice-level actions (delete, duplicate)
+# ===========================================================================
+from app.schemas.invoice_actions import (           # noqa: E402
+    InvoiceDeleteRequest,
+    InvoiceDuplicateRequest,
+)
+
+
+@router.delete("/invoices/{invoice_id}", status_code=200)
+async def delete_invoice(
+    invoice_id: uuid.UUID,
+    payload: InvoiceDeleteRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    admin: Annotated[CurrentAdmin, Depends(get_current_admin)],
+) -> dict:
+    """Soft-delete via status CANCELLED. We DO NOT hard-delete — an
+    invoice may have been shared or referenced externally. The Excel
+    file on disk is preserved."""
+    inv = await invoice_repo.get_by_id(db, invoice_id)
+    if inv is None:
+        raise NotFoundError(f"Invoice {invoice_id} not found.")
+    if inv.status == InvoiceStatus.CANCELLED.value:
+        raise ConflictError("Invoice is already cancelled.")
+
+    inv.status = InvoiceStatus.CANCELLED.value
+    # Note the reason in snapshot so future readers understand the state.
+    snap = dict(inv.snapshot_data or {})
+    snap["cancelled_reason"] = payload.reason
+    snap["cancelled_by"] = admin.email
+    from datetime import UTC, datetime
+    snap["cancelled_at"] = datetime.now(UTC).isoformat()
+    inv.snapshot_data = snap
+
+    await db.commit()
+    return {
+        "id": str(inv.id),
+        "status": inv.status,
+        "message": "Invoice cancelled.",
+    }
+
+
+@router.post("/invoices/{invoice_id}/duplicate", status_code=201)
+async def duplicate_invoice(
+    invoice_id: uuid.UUID,
+    payload: InvoiceDuplicateRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    admin: Annotated[CurrentAdmin, Depends(get_current_admin)],
+) -> dict:
+    """Create a new editable DRAFT from an approved invoice.
+
+    Use case: same client asks for a recurring bill with slight tweaks —
+    duplicate the last invoice, edit line items, submit for review again.
+    Line items copy over exactly (including manual_override flags) so
+    the reviewer sees a familiar starting point.
+    """
+    inv = await invoice_repo.get_by_id(db, invoice_id)
+    if inv is None:
+        raise NotFoundError(f"Invoice {invoice_id} not found.")
+
+    snap = inv.snapshot_data or {}
+    # Fresh invoice number so the new draft doesn't collide.
+    new_invoice_no = await invoice_repo.next_invoice_number(db)
+
+    from datetime import date
+    from decimal import Decimal
+
+    # Copy line_items EXACTLY — including `removed` flags so a duplicate
+    # of an edited invoice starts from the same state the reviewer approved.
+    lines = list(snap.get("line_items") or [])
+
+    draft = await draft_repo.create(
+        db,
+        claim_id=inv.claim_id,
+        client_id=inv.client_id,
+        job_id=None,
+        created_by=None,
+        invoice_no=new_invoice_no,
+        invoice_date=date.today(),
+        gnc_file_no=snap.get("gnc_file_no", ""),
+        client_details=snap.get("client_details") or {},
+        insured_details=snap.get("insured_details") or {},
+        loss_details=snap.get("loss_details") or {},
+        line_items=lines,
+        billing_period_start=inv.billing_period_start,
+        billing_period_end=inv.billing_period_end,
+        subtotal=Decimal(str(snap.get("subtotal") or 0)),
+        grand_total=Decimal(str(snap.get("grand_total") or inv.amount)),
+        currency=inv.currency,
+        total_emails=snap.get("total_emails", 0),
+        emails_reviewed=0,
+    )
+
+    # Record provenance in approval_history — reviewer sees "duplicated from X"
+    hist = list(draft.approval_history or [])
+    from datetime import UTC, datetime
+    hist.append({
+        "at": datetime.now(UTC).isoformat(),
+        "action": "duplicated",
+        "from_status": None,
+        "to_status": "DRAFT",
+        "user_id": admin.email,
+        "note": payload.note or f"Duplicated from invoice {inv.invoice_no}",
+        "change": {
+            "source_invoice_id": str(inv.id),
+            "source_invoice_no": inv.invoice_no,
+        },
+    })
+    draft.approval_history = hist
+    await db.commit()
+
+    return {
+        "draft_id": str(draft.id),
+        "invoice_no": draft.invoice_no,
+        "source_invoice_no": inv.invoice_no,
+        "message": f"Draft {draft.invoice_no} created from {inv.invoice_no}.",
+    }
