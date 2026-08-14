@@ -81,3 +81,43 @@ async def update_status(
     draft.status = status.value
     if approved_invoice_id is not None:
         draft.approved_invoice_id = approved_invoice_id
+
+
+async def list_paginated(
+    session: AsyncSession,
+    *,
+    status: str | None = None,
+    statuses: list[str] | None = None,
+    client_id: uuid.UUID | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[InvoiceDraft], int]:
+    """Paginated list across all drafts. Filters: status (single), statuses
+    (list — takes precedence), client_id. Newest first.
+
+    Used by the dashboard's "Pending Review" section — we can query
+    multiple statuses at once (DRAFT + PENDING_*) with a single call.
+    """
+    from sqlalchemy import and_, func
+
+    conditions = []
+    if statuses:
+        conditions.append(InvoiceDraft.status.in_(statuses))
+    elif status:
+        conditions.append(InvoiceDraft.status == status)
+    if client_id is not None:
+        conditions.append(InvoiceDraft.client_id == client_id)
+
+    where = and_(*conditions) if conditions else None
+
+    count_stmt = select(func.count(InvoiceDraft.id))
+    if where is not None:
+        count_stmt = count_stmt.where(where)
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    rows_stmt = select(InvoiceDraft).order_by(InvoiceDraft.created_at.desc())
+    if where is not None:
+        rows_stmt = rows_stmt.where(where)
+    rows_stmt = rows_stmt.limit(limit).offset(offset)
+    rows = (await session.execute(rows_stmt)).scalars().all()
+    return list(rows), int(total)
