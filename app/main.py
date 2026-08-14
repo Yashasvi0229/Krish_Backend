@@ -92,6 +92,11 @@ def create_app() -> FastAPI:
     app.include_router(rules_router,     prefix="/api/rules",     tags=["rules"])
     app.include_router(clients_router,   prefix="/api/clients",   tags=["clients"])
 
+    # Admin — destructive operations. Own router so it's clearly separated
+    # in Swagger and easy to lock down further later (e.g. by role).
+    from app.api.admin import router as admin_router
+    app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
+
     return app
 
 
