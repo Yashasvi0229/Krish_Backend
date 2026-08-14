@@ -416,6 +416,27 @@ async def _find_or_create_claim(
         if claim:
             return claim
 
+    # ---- Step 1b: try GLOBAL claim_no / file_name lookup.
+    # In single-tenant testing (Phase 1) users search without specifying
+    # a client. A prior sync may have anchored the claim under the real
+    # client (e.g. Kendal Adjusters). Skipping straight to the placeholder
+    # "Unassigned" lookup would miss that existing claim and create a
+    # duplicate empty one — which then fails at analyze-time with
+    # "no emails for this claim". Global lookup first prevents that.
+    if client_id is None and (claim_no or file_name):
+        matches = await claim_repo.search_by_identifiers(
+            session, claim_no=claim_no, file_name=file_name,
+        )
+        if matches:
+            # If multiple, prefer one already tied to a non-placeholder
+            # client (i.e. any Client that isn't literally "Unassigned").
+            for c in matches:
+                owner = await session.get(Client, c.client_id)
+                if owner and owner.name != "Unassigned":
+                    return c
+            # Otherwise, first match still beats creating a fresh row.
+            return matches[0]
+
     # ---- Step 2: resolve client_id BEFORE the (client_id, claim_no) lookup
     # so a retry finds the existing claim instead of re-inserting.
     if client_id is None:
