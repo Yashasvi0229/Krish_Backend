@@ -145,12 +145,26 @@ async def advance_stage(
             render_invoice_xlsx, save_invoice_file,
         )
 
-        client = await session.get(Client, draft.client_id)
-        rate = _resolve_hourly_rate(client, hourly_rate_for_final)
-
         active_lines = [
             li for li in (draft.line_items or []) if not li.get("removed")
         ]
+        # Guard: refuse to create an empty invoice. This is the last stop
+        # before an Excel gets rendered and an Invoice row inserted — an
+        # empty draft here would produce a $0 or broken invoice with no
+        # billable content. Force the reviewer to add lines first.
+        if not active_lines:
+            raise ConflictError(
+                "Cannot approve — draft has no billable line items. "
+                "Add at least one line or reject this draft."
+            )
+        if float(draft.grand_total or 0) <= 0:
+            raise ConflictError(
+                "Cannot approve — draft total is zero or negative. "
+                "Check the line items before finalizing."
+            )
+
+        client = await session.get(Client, draft.client_id)
+        rate = _resolve_hourly_rate(client, hourly_rate_for_final)
         xlsx_bytes = render_invoice_xlsx(
             invoice_no=draft.invoice_no,
             invoice_date=draft.invoice_date,
