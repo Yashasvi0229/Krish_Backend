@@ -180,6 +180,7 @@ async def _analyze_claim_async(
                 claim_id=claim_id,
                 client_id=(client.id if client else None),
                 attachment_analyses=attachment_analyses,
+                email_analyses=email_analyses,
             )
         except Exception:  # noqa: BLE001 — enrichment is best-effort
             log.exception("enrichment_failed", claim_id=str(claim_id))
@@ -473,9 +474,10 @@ async def _enrich_from_ai_facts(
     claim_id: uuid.UUID,
     client_id: uuid.UUID | None,
     attachment_analyses: dict[uuid.UUID, Any],
+    email_analyses: dict[uuid.UUID, Any] | None = None,
 ) -> None:
     """Update the placeholder client and the claim's insured_details from
-    facts the AI extracted from attachments.
+    facts the AI extracted from attachments AND emails.
 
     Called once per analyze-claim job, AFTER all attachments have been
     analyzed. Idempotent — safe to re-run: it only OVERWRITES fields
@@ -483,24 +485,30 @@ async def _enrich_from_ai_facts(
 
     Fields the AI can extract (see attachment schema `key_facts`):
         insured_name, client_name, claim_no, gnc_file_no, adjuster_file_no,
-        date_of_loss, total_rcv, total_acv, op_percent
+        date_of_loss, total_rcv, total_acv, op_percent,
+        client_email, client_phone, client_address, client_contact_name
 
-    Priority when the same field appears in multiple attachments:
-        * Higher-confidence analysis wins
+    Priority when the same field appears in multiple analyses:
+        * Attachments beat emails (formal docs > casual email content)
+        * Higher-confidence analysis wins within each source
         * On ties, first non-empty value wins
     """
-    if not attachment_analyses:
+    email_analyses = email_analyses or {}
+    if not attachment_analyses and not email_analyses:
         return
 
     # ---- Pick the highest-confidence key_facts per field ----
     def _bucket(conf: str) -> int:
         return {"High": 3, "Medium": 2, "Low": 1}.get(conf or "", 0)
 
-    # Sort analyses so highest confidence is processed first — later
-    # writes are skipped if we already have a value.
+    # Attachments come first (formal docs); emails top up whatever's missing.
     ordered = sorted(
         attachment_analyses.values(),
         key=lambda a: _bucket(a.confidence),
+        reverse=True,
+    ) + sorted(
+        email_analyses.values(),
+        key=lambda a: _bucket(getattr(a, "confidence", None) or ""),
         reverse=True,
     )
 
@@ -541,14 +549,99 @@ async def _enrich_from_ai_facts(
             except (ValueError, TypeError):
                 pass
 
-        # 2. Update the placeholder client with a real name/company
+        # 2. Update the placeholder client with a real name/company.
+        # If an existing (non-placeholder) client already has this name,
+        # re-link the claim to that one so we don't accumulate duplicates.
         if client_id is not None and merged.get("client_name"):
-            client_row = await session.get(Client, client_id)
-            if client_row is not None and client_row.name == "Unassigned":
-                new_name = str(merged["client_name"])[:255]
-                client_row.name = new_name
-                client_row.company_legal_name = new_name
-                log.info("enriched_client_name",
-                         client_id=str(client_id), name=new_name)
+            ai_client_name = str(merged["client_name"])[:255].strip()
+
+            # ---- Step 2a: look for an existing real client by name ----
+            # Case-insensitive exact match. We deliberately don't fuzzy-match
+            # to avoid silently linking two similarly-named companies.
+            from sqlalchemy import func as _func
+            existing_stmt = select(Client).where(
+                _func.lower(Client.name) == ai_client_name.lower(),
+                Client.deleted_at.is_(None),
+                Client.name != "Unassigned",
+                Client.id != client_id,
+            ).limit(1)
+            existing_client = (await session.execute(existing_stmt)).scalar_one_or_none()
+
+            if existing_client is not None:
+                # Re-link the claim to the real client (with proper email/phone
+                # already configured by the admin). Placeholder client stays
+                # in the DB for other claims; it'll get soft-deleted eventually.
+                claim.client_id = existing_client.id
+                # Even for existing clients, fill in any BLANK contact fields
+                # from the AI extraction — harmless enrichment, and helpful
+                # if the admin created a stub with just the name.
+                _fill_client_contact_from_facts(existing_client, merged,
+                                                 only_if_blank=True)
+                log.info(
+                    "relinked_claim_to_existing_client",
+                    claim_id=str(claim_id),
+                    from_client_id=str(client_id),
+                    to_client_id=str(existing_client.id),
+                    name=ai_client_name,
+                )
+            else:
+                # No match — promote the placeholder in place. Also copy any
+                # contact info the AI extracted. If nothing extracted, wipe
+                # the fake "unassigned@example.com" / "—" values so the
+                # invoice ships with clean blanks rather than fake data.
+                client_row = await session.get(Client, client_id)
+                if client_row is not None and client_row.name == "Unassigned":
+                    client_row.name = ai_client_name
+                    client_row.company_legal_name = ai_client_name
+                    _fill_client_contact_from_facts(client_row, merged,
+                                                     only_if_blank=False)
+                    log.info("promoted_placeholder_client",
+                             client_id=str(client_id), name=ai_client_name,
+                             email=client_row.email or "(blank)",
+                             phone=client_row.phone or "(blank)")
 
         await session.commit()
+
+
+def _fill_client_contact_from_facts(client_row, facts: dict, *,
+                                     only_if_blank: bool) -> None:
+    """Populate client email/phone/address/contact-name from AI facts.
+
+    `only_if_blank=True`  → only fill fields that are currently empty or
+                             placeholder values (safe for existing clients
+                             the admin has already configured).
+    `only_if_blank=False` → always overwrite placeholder values (safe for
+                             a fresh "Unassigned" client we're promoting).
+
+    Placeholder values we treat as blank: '', '—', 'unassigned@example.com'.
+    """
+    def _is_blank(v: str | None) -> bool:
+        return not v or v in ("—", "unassigned@example.com")
+
+    ai_email = str(facts.get("client_email") or "").strip()[:255]
+    if ai_email and (not only_if_blank or _is_blank(client_row.email)):
+        client_row.email = ai_email
+
+    ai_phone = str(facts.get("client_phone") or "").strip()[:50]
+    if ai_phone and (not only_if_blank or _is_blank(client_row.phone)):
+        client_row.phone = ai_phone
+
+    ai_addr = str(facts.get("client_address") or "").strip()[:500]
+    if ai_addr and (not only_if_blank or _is_blank(client_row.address_line1)):
+        client_row.address_line1 = ai_addr
+
+    ai_contact = str(facts.get("client_contact_name") or "").strip()[:255]
+    if ai_contact and (not only_if_blank or _is_blank(client_row.primary_contact_name)):
+        client_row.primary_contact_name = ai_contact
+
+    # If AI didn't provide anything but the row still has placeholders,
+    # wipe them (invoice looks cleaner with "—" than with fake email).
+    if not only_if_blank:
+        if _is_blank(client_row.email):
+            client_row.email = ""
+        if _is_blank(client_row.phone):
+            client_row.phone = ""
+        if _is_blank(client_row.address_line1):
+            client_row.address_line1 = ""
+        if _is_blank(client_row.primary_contact_name):
+            client_row.primary_contact_name = ""
