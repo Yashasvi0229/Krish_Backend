@@ -218,6 +218,14 @@ class EmailAnalysisOutput(BaseModel):
             "classification is UNCLEAR."
         )
     )
+    key_facts: "KeyFacts" = Field(
+        description=(
+            "Facts extracted from the email (sender signature, headers, body). "
+            "Every sub-field is optional; leave null when not clearly stated. "
+            "Client contact fields (client_email/phone/address) come from the "
+            "sender's signature block when the sender is the adjusting firm."
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +291,48 @@ class KeyFacts(BaseModel):
         default=None,
         description="Overhead & Profit percentage (as number 0-100).",
         ge=0, le=100,
+    )
+
+    # ---- Client contact info (extracted from email signatures/headers) ----
+    # These populate the CLIENT row so the invoice ships with real contact
+    # details instead of the "unassigned@example.com" placeholder. The AI
+    # should pull these from email headers (From:) and email signature
+    # blocks in the body text — NOT invent them.
+    client_email: str | None = Field(
+        default=None,
+        description=(
+            "Client's business email — usually the sender's address on "
+            "outgoing emails from the adjusting firm (e.g. "
+            "'belluscij@kendaladj.com'). Only extract if clearly present "
+            "in the From: header or signature block. Do NOT invent."
+        ),
+        max_length=255,
+    )
+    client_phone: str | None = Field(
+        default=None,
+        description=(
+            "Client's business phone from email signature (e.g. "
+            "'+1-604-555-1234'). Only extract if explicitly written."
+        ),
+        max_length=50,
+    )
+    client_address: str | None = Field(
+        default=None,
+        description=(
+            "Client's business address from email signature or letterhead "
+            "(one line, e.g. '1600 - 200 Burrard St, Vancouver BC'). "
+            "Combine multi-line addresses into one comma-separated string."
+        ),
+        max_length=500,
+    )
+    client_contact_name: str | None = Field(
+        default=None,
+        description=(
+            "Named individual at the client company (e.g. 'Joe Bellusci' "
+            "from signature or 'From:' header display name). Different "
+            "from client_name which is the COMPANY."
+        ),
+        max_length=255,
     )
 
 
@@ -474,3 +524,10 @@ def _make_strict(schema: dict[str, Any]) -> None:
     # Resolve $defs so strict rules also apply inside them.
     for sub in (schema.get("$defs") or {}).values():
         _make_strict(sub)
+
+
+# Resolve the forward reference from EmailAnalysisOutput → KeyFacts.
+# Python evaluates class bodies top-down, but EmailAnalysisOutput was
+# defined before KeyFacts; the string annotation lets us rebuild once
+# both classes are in scope.
+EmailAnalysisOutput.model_rebuild()
