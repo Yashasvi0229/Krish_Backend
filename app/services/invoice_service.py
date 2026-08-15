@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -99,6 +100,9 @@ def render_invoice_xlsx(
         ws.column_dimensions[get_column_letter(col)].width = width
 
     # ---- 1. Header ----
+    # Merge cells for the text banner, then overlay the logo image in cell A1.
+    # The logo file lives in `app/assets/gnc-logo.jpg` — bundled with the
+    # backend so Excel generation doesn't need a network fetch.
     ws.merge_cells("A1:G3")
     hdr = ws["A1"]
     hdr.value = "GNC GROUP INC.\nProperty Damage Consultants"
@@ -108,6 +112,20 @@ def render_invoice_xlsx(
     ws.row_dimensions[1].height = 24
     ws.row_dimensions[2].height = 24
     ws.row_dimensions[3].height = 24
+
+    # Overlay logo — best-effort. If the file is missing (unusual deploy),
+    # we just skip it; the text header alone is still a valid invoice.
+    logo_path = Path(__file__).resolve().parent.parent / "assets" / "gnc-logo.jpg"
+    if logo_path.exists():
+        try:
+            img = XLImage(str(logo_path))
+            # Scale to fit ~2 header rows tall; keeps proportions natural.
+            img.height = 55
+            img.width = 88
+            # Anchor to A1 so the logo sits on the left edge of the banner.
+            ws.add_image(img, "A1")
+        except Exception:  # noqa: BLE001 — image is decorative, not critical
+            pass
 
     # ---- 2. Invoice meta ----
     row = 5
