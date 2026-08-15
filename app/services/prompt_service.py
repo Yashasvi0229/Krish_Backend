@@ -143,6 +143,26 @@ than politeness.
 10. `is_internal` FIELD — You may see an `is_internal: true` flag in the
     input metadata. Treat it as a hint (all-@gncgroup.ca participants);
     still apply rule #1 above.
+
+11. KEY_FACTS EXTRACTION (attachments and emails) — Whenever the input
+    contains explicit information matching a `key_facts` field, extract
+    it. Rules:
+
+    * Extract ONLY what is clearly written. Never guess a phone number
+      from an area code or invent an email from a name.
+    * `client_email`, `client_phone`, `client_address`, `client_contact_name`
+      come from the ADJUSTING FIRM's email signature, letterhead, or
+      From: header — NOT the insured, NOT the carrier, NOT GNC.
+      For emails, the sender's address (From:) is a strong signal if the
+      sender belongs to the adjusting firm (e.g. non-@gncgroup.ca, and
+      the email content shows they're the client contact).
+    * If a signature has multi-line address ("Suite 200 / 200 Burrard St
+      / Vancouver BC V6C 3L6"), collapse it into a single comma-separated
+      line for `client_address`.
+    * If the same field appears with different values across attachments,
+      pick the value from the highest-confidence analysis (this is done
+      by the enrichment layer — you just extract what you see).
+    * Leave a field null rather than filling with something uncertain.
 </hard_rules>
 
 <billing_rules_table>
@@ -305,4 +325,4 @@ Produce the JSON now.
 # ---------------------------------------------------------------------------
 # v1.3 — fix OpenAI strict-mode $ref sibling issue (description next to $ref
 #        was rejected as "$ref cannot have keywords {description}").
-PROMPT_VERSION = "v1.3"
+PROMPT_VERSION = "v1.4"
