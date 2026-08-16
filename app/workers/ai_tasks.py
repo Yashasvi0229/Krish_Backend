@@ -39,6 +39,7 @@ from app.repositories import (
     ai_analysis_repo,
     claim_repo,
     draft_repo,
+    invoice_repo,
     job_repo,
 )
 from app.services import ai_service, billing_service, job_service
@@ -130,14 +131,19 @@ async def _analyze_claim_async(
         # ran out of items — wasted parallelism. Combining them into one
         # gather() keeps every worker slot busy from start to finish.
         #
-        # CONCURRENCY = 12 headroom:
-        #   * OpenAI defaults 500 rpm; our peak burst is ~30/min → 6% of quota
-        #   * DB pool default is 20 connections; 12 workers × 1 session = fits
-        #   * Cold start on Render adds ~30s BEFORE this runs — this pool
-        #     size is bounded by AI latency, not compute
-        # Empirically halves the AI-analysis phase (~10s → ~5s for a
-        # typical claim with 13 emails + 9 attachments).
-        CONCURRENCY = 12
+        # CONCURRENCY = 6 — tuned for Render free tier (512 MB RAM).
+        # We tried 12 briefly for a 2x speedup, but 12 concurrent workers
+        # each holding: 1 DB session + 1 OpenAI response (~50-200 KB each
+        # for key_facts + reasoning) + associated Python objects pushed
+        # peak RSS past ~450 MB — close enough to the 512 MB limit that
+        # Render's OOM killer sometimes reaped the worker, showing up
+        # as 502 Bad Gateway on the client side.
+        #
+        # 6 keeps peak RSS around ~250 MB with comfortable headroom.
+        # AI phase is ~7s at concurrency=6 vs ~5s at 12 — worth the
+        # extra 2s for the stability. Bump only after upgrading to a
+        # paid Render plan with more RAM.
+        CONCURRENCY = 6
         sem = asyncio.Semaphore(CONCURRENCY)
 
         email_analyses: dict[uuid.UUID, Any] = {}
@@ -247,8 +253,17 @@ async def _analyze_claim_async(
         await _progress(job_id, 85, 3, "Applying billing rules", stats)
 
         # Re-read the enriched client so hourly_rate reflects any updates.
+        # Also load which email/attachment IDs have already been billed in
+        # a PRIOR APPROVED invoice for this claim — we filter those out so
+        # the same work never appears on two invoices. Cancelled invoices
+        # don't count (their items are released back into the billable pool).
         async with AsyncSessionLocal() as session:
             client = await session.get(Client, claim.client_id) if claim else None
+            billed_email_ids, billed_attachment_ids = (
+                await invoice_repo.get_billed_source_ids(session, claim_id=claim_id)
+            )
+        stats["already_billed_emails"] = 0
+        stats["already_billed_attachments"] = 0
 
         line_items: list[dict[str, Any]] = []
         hourly_rate = _resolve_hourly_rate(client)
@@ -256,6 +271,11 @@ async def _analyze_claim_async(
 
         # Emails first, in date order
         for email in emails:
+            # Dedup guard: skip anything already invoiced in an APPROVED
+            # invoice for this claim. Prevents double billing.
+            if email.id in billed_email_ids:
+                stats["already_billed_emails"] += 1
+                continue
             analysis = email_analyses.get(email.id)
             if analysis is None or not analysis.is_billable:
                 continue
@@ -294,6 +314,9 @@ async def _analyze_claim_async(
 
         # Attachments next
         for att in attachments:
+            if att.id in billed_attachment_ids:
+                stats["already_billed_attachments"] += 1
+                continue
             analysis = attachment_analyses.get(att.id)
             if analysis is None or not analysis.is_billable:
                 continue
