@@ -125,46 +125,31 @@ async def _analyze_claim_async(
 
         await _progress(job_id, 5, 1, "Analyzing emails + attachments", stats)
 
-        # ---- Analyze emails AND attachments IN ONE PARALLEL BATCH ----
-        # Previously: emails finished FIRST, then attachments started. That
-        # left the second half of the semaphore idle whenever email work
-        # ran out of items — wasted parallelism. Combining them into one
-        # gather() keeps every worker slot busy from start to finish.
+        await _progress(job_id, 5, 1, "Analyzing emails", stats)
+
+        # ---- Analyze emails in PARALLEL ----
+        # ORIGINAL STRUCTURE — restored from the pre-parallel-boost state.
+        # Two separate gather() calls (emails first, then attachments)
+        # keep peak RAM predictable on Render's 512 MB free tier — a
+        # single combined batch with concurrency=12 was causing OOM
+        # crashes (502 Bad Gateway). Serialized phases + concurrency=6
+        # is the rock-solid safe combo.
         #
-        # CONCURRENCY = 6 — tuned for Render free tier (512 MB RAM).
-        # We tried 12 briefly for a 2x speedup, but 12 concurrent workers
-        # each holding: 1 DB session + 1 OpenAI response (~50-200 KB each
-        # for key_facts + reasoning) + associated Python objects pushed
-        # peak RSS past ~450 MB — close enough to the 512 MB limit that
-        # Render's OOM killer sometimes reaped the worker, showing up
-        # as 502 Bad Gateway on the client side.
-        #
-        # 6 keeps peak RSS around ~250 MB with comfortable headroom.
-        # AI phase is ~7s at concurrency=6 vs ~5s at 12 — worth the
-        # extra 2s for the stability. Bump only after upgrading to a
-        # paid Render plan with more RAM.
+        # Bounded via Semaphore because we:
+        #   * Don't blow past OpenAI's per-minute rate limit
+        #   * Don't overwhelm the DB connection pool (each analysis opens
+        #     its own AsyncSession)
+        #   * Keep the process memory footprint predictable
         CONCURRENCY = 6
         sem = asyncio.Semaphore(CONCURRENCY)
 
         email_analyses: dict[uuid.UUID, Any] = {}
-        attachment_analyses: dict[uuid.UUID, Any] = {}
         # Shared counter closed over by workers to update progress. asyncio
         # is single-threaded per event loop, so integer increments are safe
-        # without a lock — the `await` boundaries are the only points where
-        # another coroutine can preempt, and we only touch `done_count`
-        # between awaits (not during them).
+        # without a lock — the `await` boundary is the only place another
+        # coroutine can preempt, and we only touch `done_count` between
+        # awaits (not during them).
         done_count = 0
-
-        async def _push_progress():
-            """Emit a progress event without blocking work if the push fails."""
-            pct = 5 + done_count / max(total_units, 1) * 80  # 5→85 across all AI
-            try:
-                await _progress(
-                    job_id, pct, 1,
-                    f"AI analysis ({done_count}/{total_units})", stats,
-                )
-            except Exception:  # noqa: BLE001 — next progress will catch up
-                log.debug("progress_push_failed", done=done_count)
 
         async def _analyze_one_email(email_id: uuid.UUID):
             nonlocal done_count
@@ -188,11 +173,29 @@ async def _analyze_claim_async(
                 stats["emails_analyzed"] += 1
                 _accumulate(stats, analysis, was_cached)
                 done_count += 1
-                await _push_progress()
+                pct = 5 + done_count / max(total_units, 1) * 60
+                # Fire-and-forget progress push. Failures here should not
+                # abort the whole batch — the next progress will cover it.
+                try:
+                    await _progress(
+                        job_id, pct, 1,
+                        f"Analyzing emails ({done_count}/{len(emails)})", stats,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug("progress_push_failed", email_id=str(email_id))
                 return analysis
 
+        await asyncio.gather(
+            *(_analyze_one_email(e.id) for e in emails),
+            return_exceptions=False,  # let real failures propagate + fail the job
+        )
+
+        # ---- Analyze attachments in PARALLEL ----
+        attachment_analyses: dict[uuid.UUID, Any] = {}
+        att_done = 0
+
         async def _analyze_one_attachment(att_id: uuid.UUID):
-            nonlocal done_count
+            nonlocal att_done
             async with sem:
                 async with AsyncSessionLocal() as session:
                     a = await session.get(Attachment, att_id)
@@ -209,16 +212,18 @@ async def _analyze_claim_async(
                 attachment_analyses[att_id] = analysis
                 stats["attachments_analyzed"] += 1
                 _accumulate(stats, analysis, was_cached)
-                done_count += 1
-                await _push_progress()
+                att_done += 1
+                pct = 65 + att_done / max(len(attachments), 1) * 20
+                try:
+                    await _progress(
+                        job_id, pct, 2,
+                        f"Analyzing attachments ({att_done}/{len(attachments)})", stats,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug("progress_push_failed", attachment_id=str(att_id))
                 return analysis
 
-        # Fire everything at once. The semaphore inside each worker bounds
-        # true concurrency to CONCURRENCY — asyncio's scheduler juggles the
-        # rest. `return_exceptions=False` lets a real failure propagate so
-        # the job is marked FAILED with a proper error message.
         await asyncio.gather(
-            *(_analyze_one_email(e.id) for e in emails),
             *(_analyze_one_attachment(a.id) for a in attachments),
             return_exceptions=False,
         )
