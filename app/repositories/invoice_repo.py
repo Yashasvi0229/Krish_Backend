@@ -151,3 +151,49 @@ async def create(
     session.add(inv)
     await session.flush()
     return inv
+
+
+async def get_billed_source_ids(
+    session: AsyncSession, *, claim_id: uuid.UUID,
+) -> tuple[set[uuid.UUID], set[uuid.UUID]]:
+    """Return (email_ids, attachment_ids) that already appear in an
+    APPROVED invoice for this claim.
+
+    This is the dedup source of truth for preventing double-billing.
+    We ONLY look at APPROVED invoices — CANCELLED ones should release
+    their source items back into the billable pool.
+
+    Implementation: line_items are stored in snapshot_data JSONB. We walk
+    the array in Python (small — max ~30 lines per invoice, few invoices
+    per claim). A JSONB path query would be faster at scale, but this is
+    correct and readable for the current data volumes.
+    """
+    from sqlalchemy import select
+    from app.models.invoice import Invoice
+
+    stmt = select(Invoice).where(
+        Invoice.claim_id == claim_id,
+        Invoice.status == "APPROVED",
+    )
+    invoices = (await session.execute(stmt)).scalars().all()
+
+    email_ids: set[uuid.UUID] = set()
+    attachment_ids: set[uuid.UUID] = set()
+    for inv in invoices:
+        snap = inv.snapshot_data or {}
+        for line in (snap.get("line_items") or []):
+            if line.get("removed"):
+                continue
+            eid = line.get("source_email_id")
+            aid = line.get("source_attachment_id")
+            if eid:
+                try:
+                    email_ids.add(uuid.UUID(str(eid)))
+                except (ValueError, TypeError):
+                    pass
+            if aid:
+                try:
+                    attachment_ids.add(uuid.UUID(str(aid)))
+                except (ValueError, TypeError):
+                    pass
+    return email_ids, attachment_ids
