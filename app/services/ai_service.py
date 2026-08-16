@@ -265,36 +265,52 @@ async def _save_email_success(
     flag_reason = "; ".join(parsed.warnings) if parsed.warnings else (
         f"Confidence {parsed.confidence} below threshold" if should_flag else None
     )
-    return await ai_analysis_repo.create(
-        session,
-        email_id=email.id, attachment_id=None,
-        input_hash=input_hash,
-        analysis_type=AnalysisType.EMAIL_CLASSIFY,
-        provider=AIProvider.OPENAI,
-        model=result.model,
-        prompt_version=result.prompt_version,
-        is_billable=is_billable,
-        category=parsed.classification,
-        rule_code=parsed.billing_rule_code,
-        recommended_hours=None,   # engine computes; we store the raw AI proposal
-        confidence=_confidence_bucket(parsed.confidence),
-        summary=parsed.summary,
-        invoice_description=parsed.invoice_description,
-        reasoning=parsed.reasoning,
-        should_flag=should_flag,
-        flag_reason=flag_reason,
-        input_tokens=result.input_tokens,
-        output_tokens=result.output_tokens,
-        cost_usd=Decimal(str(result.cost_usd)),
-        latency_ms=result.latency_ms,
-        raw_response={
-            "parsed": parsed.model_dump(),
-            "confidence_int": parsed.confidence,
-            "quantity": parsed.quantity.model_dump() if parsed.quantity else None,
-            "estimate_amount_usd": parsed.estimate_amount_usd,
-            "building_count": parsed.building_count,
-        },
-    )
+    # Race-safe insert — see _save_failed for the full rationale. In the
+    # success path a collision is extremely unlikely (deterministic hash
+    # for identical content usually short-circuits at the cache layer
+    # before we ever call OpenAI), but the guard costs nothing and
+    # prevents pathological corner cases from killing the pipeline.
+    from sqlalchemy.exc import IntegrityError
+    savepoint = await session.begin_nested()
+    try:
+        analysis = await ai_analysis_repo.create(
+            session,
+            email_id=email.id, attachment_id=None,
+            input_hash=input_hash,
+            analysis_type=AnalysisType.EMAIL_CLASSIFY,
+            provider=AIProvider.OPENAI,
+            model=result.model,
+            prompt_version=result.prompt_version,
+            is_billable=is_billable,
+            category=parsed.classification,
+            rule_code=parsed.billing_rule_code,
+            recommended_hours=None,   # engine computes; we store the raw AI proposal
+            confidence=_confidence_bucket(parsed.confidence),
+            summary=parsed.summary,
+            invoice_description=parsed.invoice_description,
+            reasoning=parsed.reasoning,
+            should_flag=should_flag,
+            flag_reason=flag_reason,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cost_usd=Decimal(str(result.cost_usd)),
+            latency_ms=result.latency_ms,
+            raw_response={
+                "parsed": parsed.model_dump(),
+                "confidence_int": parsed.confidence,
+                "quantity": parsed.quantity.model_dump() if parsed.quantity else None,
+                "estimate_amount_usd": parsed.estimate_amount_usd,
+                "building_count": parsed.building_count,
+            },
+        )
+        await savepoint.commit()
+        return analysis
+    except IntegrityError:
+        await savepoint.rollback()
+        existing = await ai_analysis_repo.get_by_input_hash(session, input_hash)
+        if existing is not None:
+            return existing
+        raise
 
 
 async def _save_attachment_success(
@@ -310,63 +326,110 @@ async def _save_attachment_success(
     flag_reason = "; ".join(parsed.warnings) if parsed.warnings else (
         f"Confidence {parsed.confidence} below threshold" if should_flag else None
     )
-    return await ai_analysis_repo.create(
-        session,
-        email_id=None, attachment_id=attachment.id,
-        input_hash=input_hash,
-        analysis_type=AnalysisType.ATTACHMENT_SUMMARY,
-        provider=AIProvider.OPENAI,
-        model=result.model,
-        prompt_version=result.prompt_version,
-        is_billable=is_billable,
-        category=parsed.document_type,
-        rule_code=parsed.billing_rule_code,
-        recommended_hours=None,
-        confidence=_confidence_bucket(parsed.confidence),
-        summary=parsed.summary,
-        invoice_description=parsed.invoice_description,
-        reasoning=parsed.reasoning,
-        should_flag=should_flag,
-        flag_reason=flag_reason,
-        input_tokens=result.input_tokens,
-        output_tokens=result.output_tokens,
-        cost_usd=Decimal(str(result.cost_usd)),
-        latency_ms=result.latency_ms,
-        raw_response={
-            "parsed": parsed.model_dump(),
-            "confidence_int": parsed.confidence,
-            "quantity": parsed.quantity.model_dump() if parsed.quantity else None,
-            "estimate_amount_usd": parsed.estimate_amount_usd,
-            "building_count": parsed.building_count,
-            "key_facts": parsed.key_facts.model_dump() if parsed.key_facts else {},
-        },
-    )
+    # Race-safe insert (see _save_failed for full rationale).
+    from sqlalchemy.exc import IntegrityError
+    savepoint = await session.begin_nested()
+    try:
+        analysis = await ai_analysis_repo.create(
+            session,
+            email_id=None, attachment_id=attachment.id,
+            input_hash=input_hash,
+            analysis_type=AnalysisType.ATTACHMENT_SUMMARY,
+            provider=AIProvider.OPENAI,
+            model=result.model,
+            prompt_version=result.prompt_version,
+            is_billable=is_billable,
+            category=parsed.document_type,
+            rule_code=parsed.billing_rule_code,
+            recommended_hours=None,
+            confidence=_confidence_bucket(parsed.confidence),
+            summary=parsed.summary,
+            invoice_description=parsed.invoice_description,
+            reasoning=parsed.reasoning,
+            should_flag=should_flag,
+            flag_reason=flag_reason,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cost_usd=Decimal(str(result.cost_usd)),
+            latency_ms=result.latency_ms,
+            raw_response={
+                "parsed": parsed.model_dump(),
+                "confidence_int": parsed.confidence,
+                "quantity": parsed.quantity.model_dump() if parsed.quantity else None,
+                "estimate_amount_usd": parsed.estimate_amount_usd,
+                "building_count": parsed.building_count,
+                "key_facts": parsed.key_facts.model_dump() if parsed.key_facts else {},
+            },
+        )
+        await savepoint.commit()
+        return analysis
+    except IntegrityError:
+        await savepoint.rollback()
+        existing = await ai_analysis_repo.get_by_input_hash(session, input_hash)
+        if existing is not None:
+            return existing
+        raise
 
 
 async def _save_failed(
     session, *, email_id: uuid.UUID | None, attachment_id: uuid.UUID | None,
     analysis_type: AnalysisType, input_hash: str, error: str,
 ) -> AIAnalysis:
-    """Persist a row so the reviewer knows analysis was attempted and failed."""
-    return await ai_analysis_repo.create(
-        session,
-        email_id=email_id, attachment_id=attachment_id,
-        input_hash=input_hash,
-        analysis_type=analysis_type,
-        provider=AIProvider.OPENAI,
-        model=settings.ai_model_primary,
-        prompt_version=PROMPT_VERSION,
-        is_billable=None, category=None, rule_code=None,
-        recommended_hours=None,
-        confidence=Confidence.LOW.value,
-        summary=None, invoice_description=None,
-        reasoning=None,
-        should_flag=True,
-        flag_reason=f"AI call failed: {error[:800]}",
-        input_tokens=0, output_tokens=0, cost_usd=Decimal("0"),
-        latency_ms=0,
-        raw_response={"error": error[:2000]},
-    )
+    """Persist a row so the reviewer knows analysis was attempted and failed.
+
+    Race-safe: multiple parallel workers can hit an OpenAI 429 for the
+    SAME email/attachment content in quick succession. Each tries to save
+    a failure row keyed by the same `input_hash`, and only the first wins
+    the UNIQUE constraint. Without this guard the second worker crashes
+    the entire draft creation with a UniqueViolationError — even though
+    the "failure" itself is already properly recorded by the first worker.
+
+    Behavior on collision: rollback the failed INSERT (savepoint style so
+    the outer transaction stays clean), fetch and return whatever the
+    winning worker saved. The caller neither knows nor cares which
+    coroutine "won" — both get an AIAnalysis object back and the pipeline
+    continues.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    # Use a nested savepoint so the outer transaction survives the
+    # collision. Without this, the whole session enters a poisoned state
+    # after the IntegrityError and subsequent queries all fail.
+    savepoint = await session.begin_nested()
+    try:
+        analysis = await ai_analysis_repo.create(
+            session,
+            email_id=email_id, attachment_id=attachment_id,
+            input_hash=input_hash,
+            analysis_type=analysis_type,
+            provider=AIProvider.OPENAI,
+            model=settings.ai_model_primary,
+            prompt_version=PROMPT_VERSION,
+            is_billable=None, category=None, rule_code=None,
+            recommended_hours=None,
+            confidence=Confidence.LOW.value,
+            summary=None, invoice_description=None,
+            reasoning=None,
+            should_flag=True,
+            flag_reason=f"AI call failed: {error[:800]}",
+            input_tokens=0, output_tokens=0, cost_usd=Decimal("0"),
+            latency_ms=0,
+            raw_response={"error": error[:2000]},
+        )
+        await savepoint.commit()
+        return analysis
+    except IntegrityError:
+        # Another worker beat us to this input_hash. Roll back JUST our
+        # attempted insert (savepoint), then fetch and return the row
+        # they wrote. This is a semantically identical outcome — a
+        # persisted "AI call failed" record for that content.
+        await savepoint.rollback()
+        existing = await ai_analysis_repo.get_by_input_hash(session, input_hash)
+        if existing is not None:
+            return existing
+        # Truly unexpected — hash conflict but row not found. Re-raise
+        # to surface a real bug instead of silent data loss.
+        raise
 
 
 # ---------------------------------------------------------------------------
