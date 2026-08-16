@@ -95,7 +95,19 @@ async def download_and_process(
         # Fresh file — save + extract.
         storage_path = storage.attachment_path(hash_hex, extension)
         storage.write_bytes(storage_path, data)
-        result: ExtractionResult = extract(data, extension)
+        # OCR + PDF/DOCX/XLSX extraction is a synchronous, CPU-bound
+        # operation (Tesseract + pypdf + python-docx are all blocking).
+        # Running it directly inside this async coroutine freezes the
+        # entire event loop for the whole extraction time — during that
+        # window ALL other requests to the backend get queued or
+        # rejected (503), and the aggressive frontend polling triggers
+        # Cloudflare 429s. `asyncio.to_thread` offloads to the default
+        # thread pool executor so the event loop keeps serving requests
+        # (status checks, WebSocket pings, etc.) while OCR runs.
+        import asyncio as _asyncio
+        result: ExtractionResult = await _asyncio.to_thread(
+            extract, data, extension,
+        )
         extracted_text_snippet = (result.text or "")[:SNIPPET_MAX_CHARS]
         page_count = result.page_count
         ocr_applied = result.ocr_applied
