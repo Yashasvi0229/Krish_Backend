@@ -365,7 +365,11 @@ async def _analyze_claim_async(
         await _progress(job_id, 92, 4, "Creating invoice draft", stats)
 
         async with AsyncSessionLocal() as session:
-            from app.repositories import invoice_repo
+            # invoice_repo is already imported at module top — a nested
+            # `from ... import invoice_repo` here would mark it as a
+            # function-local variable via Python's scoping rules, making
+            # earlier references (line ~268 for get_billed_source_ids)
+            # raise UnboundLocalError. We only need the sibling service.
             from app.services import duplicate_check_service
             invoice_no = await invoice_repo.next_invoice_number(session)
 
